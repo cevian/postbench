@@ -63,7 +63,7 @@ func run(config config) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		runWatcher(config)
+		runWatcher(config, pool)
 		wg.Done()
 	}()
 
@@ -105,7 +105,7 @@ func run(config config) {
 		execSql(pool, fmt.Sprintf("TRUNCATE metric_%d", i))
 		execSql(pool, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id, time) INCLUDE (value)", i, i))
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id) INCLUDE (time, value)", i, i))
-		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> interval '5 minutes', create_default_indexes=>false);", i))
+		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
 
 		wg.Add(1)
 		go func() {
@@ -117,9 +117,81 @@ func run(config config) {
 	wg.Wait()
 }
 
-func runWatcher(config config) {
+type buffers struct {
+	checkpoint int64
+	clean      int64
+	backend    int64
+}
+
+func (t *buffers) setZero(zero *buffers) {
+	t.checkpoint -= zero.checkpoint
+	t.clean -= zero.clean
+	t.backend -= zero.backend
+}
+
+func (t *buffers) scan(pool *pgxpool.Pool) {
+	err := pool.QueryRow(context.Background(), "SELECT  buffers_checkpoint, buffers_clean, buffers_backend FROM pg_stat_bgwriter bg").
+		Scan(&t.checkpoint, &t.clean, &t.backend)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (t *buffers) bytes() int64 {
+	return (t.checkpoint + t.clean + t.backend) * 8192
+}
+
+type wal struct {
+	records int64
+	bytes   int64
+}
+
+func (t *wal) setZero(zero *wal) {
+	t.records -= zero.records
+	t.bytes -= zero.bytes
+}
+
+func (t *wal) scan(pool *pgxpool.Pool) {
+	err := pool.QueryRow(context.Background(), "SELECT wal_records, wal_bytes FROM pg_stat_wal bg").
+		Scan(&t.records, &t.bytes)
+	if err != nil {
+		panic(err)
+	}
+}
+
+type chunkSize struct {
+	index int64
+	total int64
+}
+
+func (t *chunkSize) scan(pool *pgxpool.Pool) {
+	err := pool.QueryRow(context.Background(),
+		`SELECT sum(chunk_index_size), sum(chunk_total_size) 
+		 FROM (
+		   select distinct ON (hypertable_name) 
+		     hypertable_name, 
+		     chunk_name, 
+		     pg_indexes_size(('_timescaledb_internal.'||chunk_name)::regclass) chunk_index_size, 
+		     pg_total_relation_size(('_timescaledb_internal.'||chunk_name)::regclass) chunk_total_size 
+		   from timescaledb_information.chunks 
+		   ORDER BY hypertable_name, range_end desc
+		) as info`).
+		Scan(&t.index, &t.total)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func runWatcher(config config, pool *pgxpool.Pool) {
 	t := time.NewTicker(config.reportPeriod)
 	defer t.Stop()
+
+	zeroBuffers := &buffers{}
+	zeroBuffers.scan(pool)
+	zeroWal := &wal{}
+	zeroWal.scan(pool)
+	start := time.Now()
+
 	for {
 		select {
 		case <-t.C:
@@ -127,8 +199,36 @@ func runWatcher(config config) {
 		config.ewma.Tick()
 		rate := config.ewma.Rate()
 		avg := config.ewma.AvgRate()
+		samples := config.ewma.TotalEvents()
 
-		fmt.Printf("Rate is %v, %v, %v\n", rate, int64(avg), float64(config.ewma.TotalEvents()))
+		currentBuffers := &buffers{}
+		currentBuffers.scan(pool)
+		currentBuffers.setZero(zeroBuffers)
+		//.fmt.Printf("%#v %#v %v\n", zeroBuffers, currentBuffers, currentBuffers.bytes())
+
+		currentWal := &wal{}
+		currentWal.scan(pool)
+		currentWal.setZero(zeroWal)
+
+		durS := time.Since(start).Seconds()
+		chunkSize := &chunkSize{}
+		chunkSize.scan(pool)
+
+		fmt.Printf("Rate is %.2e, %.2e, %.2e, buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f/sample, total=%.2e(MB) %4.0f(MB/s) %4.0f/sample, chunk size(MB): %8.2f %8.2f \n",
+			rate,
+			avg,
+			float64(samples),
+			float64(currentBuffers.checkpoint*8192)/float64(samples),
+			float64(currentBuffers.clean*8192)/float64(samples),
+			float64(currentBuffers.backend*8192)/float64(samples),
+			float64(currentBuffers.bytes())/float64(samples),
+			float64(currentWal.bytes)/float64(samples),
+			float64((currentBuffers.bytes()+currentWal.bytes)/(1024*1024)),
+			float64((currentBuffers.bytes()+currentWal.bytes)/(1024*1024))/durS,
+			float64((currentBuffers.bytes()+currentWal.bytes))/float64(samples),
+			float64(chunkSize.index/(1024*1024)),
+			float64(chunkSize.total/(1024*1024)),
+		)
 	}
 
 }
