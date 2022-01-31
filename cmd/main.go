@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cevian/postbench/pkg/ewma"
+	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/peterbourgon/ff/v3"
@@ -233,9 +236,67 @@ func runWatcher(config config, pool *pgxpool.Pool) {
 
 }
 
+func assertNoErr(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func CheckNetworkSizes(pool *pgxpool.Pool, timeSamples []time.Time, valSamples []float64, seriesIdSamples []int64) {
+	size := 0
+	compressedSize := 0
+	conn2, err := pool.Acquire(context.Background())
+	assertNoErr(err)
+	tsa := pgtype.TimestampArray{}
+	err = tsa.Set(timeSamples)
+	assertNoErr(err)
+	res, err := tsa.EncodeBinary(conn2.Conn().ConnInfo(), nil)
+	assertNoErr(err)
+	size += len(res)
+	buf := bytes.Buffer{}
+	zw := gzip.NewWriter(&buf)
+	_, err = zw.Write(res)
+	assertNoErr(err)
+	err = zw.Close()
+	assertNoErr(err)
+	compressedSize += buf.Len()
+
+	vala := pgtype.Float8Array{}
+	err = vala.Set(valSamples)
+	assertNoErr(err)
+	res, err = vala.EncodeBinary(conn2.Conn().ConnInfo(), nil)
+	assertNoErr(err)
+	size += len(res)
+	buf = bytes.Buffer{}
+	zw = gzip.NewWriter(&buf)
+	_, err = zw.Write(res)
+	assertNoErr(err)
+	err = zw.Close()
+	assertNoErr(err)
+	compressedSize += buf.Len()
+
+	sa := pgtype.Int8Array{}
+	err = sa.Set(seriesIdSamples)
+	assertNoErr(err)
+	res, err = sa.EncodeBinary(conn2.Conn().ConnInfo(), nil)
+	assertNoErr(err)
+	size += len(res)
+	buf = bytes.Buffer{}
+	zw = gzip.NewWriter(&buf)
+	_, err = zw.Write(res)
+	assertNoErr(err)
+	err = zw.Close()
+	assertNoErr(err)
+	compressedSize += buf.Len()
+
+	fmt.Println("size", size, "size/sample", size/len(timeSamples), "compressed", compressedSize, "compressed/sample", compressedSize/len(timeSamples))
+	conn2.Release()
+}
+
 func runInserter(config config, pool *pgxpool.Pool, metric int) {
 	ts := time.Now().Add(-time.Hour)
 	conn := pool
+	var err error
 	/*conn, err := pool.Acquire(context.Background())
 	if err != nil {
 		panic(err)
@@ -256,12 +317,14 @@ func runInserter(config config, pool *pgxpool.Pool, metric int) {
 			rand.Shuffle(len(seriesIdSamples), func(i, j int) {
 				seriesIdSamples[i], seriesIdSamples[j] = seriesIdSamples[j], seriesIdSamples[i]
 			})
+
+			//CheckNetworkSizes(pool, timeSamples, valSamples, seriesIdSamples)
 			/*insertSQL := fmt.Sprintf(
 				`INSERT INTO metric_%d(time, value, series_id)
 			SELECT * FROM unnest($1::timestamptz[], $2::double precision[], $3::bigint[]) a(t,v,s) ORDER BY s,t`, /* ON CONFLICT DO NOTHING metric)
 			_, err := pool.Exec(context.Background(), insertSQL, timeSamples, valSamples, seriesIdSamples)*/
 			insertSQL := `SELECT insert_metric_row($1::name, $2::timestamptz[], $3::double precision[], $4::bigint[])`
-			_, err := conn.Exec(context.Background(), insertSQL, fmt.Sprintf("metric_%d", metric), timeSamples, valSamples, seriesIdSamples)
+			_, err = conn.Exec(context.Background(), insertSQL, fmt.Sprintf("metric_%d", metric), timeSamples, valSamples, seriesIdSamples)
 			if err != nil {
 				panic(err)
 			}
