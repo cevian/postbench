@@ -112,6 +112,7 @@ func run(config config) {
 
 		wg.Add(1)
 		go func() {
+			//runInserterCopy(config, pool, metric)
 			runInserter(config, pool, metric)
 			wg.Done()
 		}()
@@ -158,7 +159,9 @@ func (t *wal) scan(pool *pgxpool.Pool) {
 	err := pool.QueryRow(context.Background(), "SELECT wal_records, wal_bytes FROM pg_stat_wal bg").
 		Scan(&t.records, &t.bytes)
 	if err != nil {
-		panic(err)
+		t.records = 0
+		t.bytes = 0
+		//panic(err)
 	}
 }
 
@@ -189,11 +192,16 @@ func runWatcher(config config, pool *pgxpool.Pool) {
 	t := time.NewTicker(config.reportPeriod)
 	defer t.Stop()
 
-	zeroBuffers := &buffers{}
+	zeroBuffers := buffers{}
 	zeroBuffers.scan(pool)
-	zeroWal := &wal{}
+	lastBuffers := zeroBuffers
+	zeroWal := wal{}
 	zeroWal.scan(pool)
+	lastWal := zeroWal
+
 	start := time.Now()
+	lastTime := start
+	lastSamples := int64(0)
 
 	for {
 		select {
@@ -203,35 +211,51 @@ func runWatcher(config config, pool *pgxpool.Pool) {
 		rate := config.ewma.Rate()
 		avg := config.ewma.AvgRate()
 		samples := config.ewma.TotalEvents()
+		iterSamples := samples - lastSamples
 
-		currentBuffers := &buffers{}
+		currentBuffers := buffers{}
 		currentBuffers.scan(pool)
-		currentBuffers.setZero(zeroBuffers)
-		//.fmt.Printf("%#v %#v %v\n", zeroBuffers, currentBuffers, currentBuffers.bytes())
+		sumBuffers := currentBuffers
+		sumBuffers.setZero(&zeroBuffers)
+		iterBuffers := currentBuffers
+		iterBuffers.setZero(&lastBuffers)
 
-		currentWal := &wal{}
+		currentWal := wal{}
 		currentWal.scan(pool)
-		currentWal.setZero(zeroWal)
+		sumWal := currentWal
+		sumWal.setZero(&zeroWal)
+		iterWal := currentWal
+		iterWal.setZero(&lastWal)
 
-		durS := time.Since(start).Seconds()
+		currentTime := time.Now()
+		durS := currentTime.Sub(start).Seconds()
+		iterS := currentTime.Sub(lastTime).Seconds()
 		chunkSize := &chunkSize{}
 		chunkSize.scan(pool)
 
-		fmt.Printf("Rate is %.2e, %.2e, %.2e, buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f/sample, total=%.2e(MB) %4.0f(MB/s) %4.0f/sample, chunk size(MB): %8.2f %8.2f \n",
+		fmt.Printf("Rate is %.2e, %.2e, %.2e, buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f[%4.0f]/sample %4.0fMB/s, total=%4.0f[%4.0f]MB/s %4.0f[%4.0f]/sample, chunk size(MB): %4.0f %4.0f \n",
 			rate,
 			avg,
 			float64(samples),
-			float64(currentBuffers.checkpoint*8192)/float64(samples),
-			float64(currentBuffers.clean*8192)/float64(samples),
-			float64(currentBuffers.backend*8192)/float64(samples),
-			float64(currentBuffers.bytes())/float64(samples),
-			float64(currentWal.bytes)/float64(samples),
-			float64((currentBuffers.bytes()+currentWal.bytes)/(1024*1024)),
-			float64((currentBuffers.bytes()+currentWal.bytes)/(1024*1024))/durS,
-			float64((currentBuffers.bytes()+currentWal.bytes))/float64(samples),
+			/* checkpoints report all buffers only at end of checkpoint so have to use avgs here*/
+			float64(sumBuffers.checkpoint*8192)/float64(samples),
+			float64(sumBuffers.clean*8192)/float64(samples),
+			float64(sumBuffers.backend*8192)/float64(samples),
+			float64(sumBuffers.bytes())/float64(samples),
+			float64(iterWal.bytes)/float64(iterSamples),
+			float64(sumWal.bytes)/float64(samples),
+			float64(iterWal.bytes)/(1024*1024*iterS),
+			float64((iterBuffers.bytes()+iterWal.bytes)/(1024*1024))/iterS,
+			float64((sumBuffers.bytes()+sumWal.bytes)/(1024*1024))/durS,
+			float64((iterBuffers.bytes()+iterWal.bytes))/float64(iterSamples),
+			float64((sumBuffers.bytes()+sumWal.bytes))/float64(samples),
 			float64(chunkSize.index/(1024*1024)),
 			float64(chunkSize.total/(1024*1024)),
 		)
+		lastWal = currentWal
+		lastBuffers = currentBuffers
+		lastTime = currentTime
+		lastSamples = samples
 	}
 
 }

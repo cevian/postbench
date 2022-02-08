@@ -152,7 +152,9 @@ func (t *wal) scan(pool *pgxpool.Pool) {
 	err := pool.QueryRow(context.Background(), "SELECT wal_records, wal_bytes FROM pg_stat_wal bg").
 		Scan(&t.records, &t.bytes)
 	if err != nil {
-		panic(err)
+		t.records = 0
+		t.bytes = 0
+		//panic(err)
 	}
 }
 
