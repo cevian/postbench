@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,7 +82,7 @@ func run(config config) {
 	$$
 	DECLARE
 	  num_rows BIGINT;
-	BEGIN    
+	BEGIN
 		EXECUTE FORMAT(
 		 'INSERT INTO  %1$I (time, value, series_id)
 			  SELECT * FROM unnest($1, $2, $3) a(t,v,s) ORDER BY s,t',
@@ -89,7 +90,7 @@ func run(config config) {
 		) USING time_array, value_array, series_id_array;
 		GET DIAGNOSTICS num_rows = ROW_COUNT;
 		RETURN num_rows;
-	EXCEPTION WHEN unique_violation THEN 
+	EXCEPTION WHEN unique_violation THEN
 		EXECUTE FORMAT(
 		'INSERT INTO  %1$I (time, value, series_id)
 			 SELECT * FROM unnest($1, $2, $3) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING',
@@ -108,12 +109,13 @@ func run(config config) {
 		execSql(pool, fmt.Sprintf("TRUNCATE metric_%d", i))
 		execSql(pool, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id, time) INCLUDE (value)", i, i))
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id) INCLUDE (time, value)", i, i))
+		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d USING hash (series_id)", i, i))
 		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
 
 		wg.Add(1)
 		go func() {
-			//runInserterCopy(config, pool, metric)
-			runInserter(config, pool, metric)
+			runInserterCopy(config, pool, metric)
+			//runInserter(config, pool, metric)
 			wg.Done()
 		}()
 	}
@@ -172,14 +174,14 @@ type chunkSize struct {
 
 func (t *chunkSize) scan(pool *pgxpool.Pool) {
 	err := pool.QueryRow(context.Background(),
-		`SELECT sum(chunk_index_size), sum(chunk_total_size) 
+		`SELECT sum(chunk_index_size), sum(chunk_total_size)
 		 FROM (
-		   select distinct ON (hypertable_name) 
-		     hypertable_name, 
-		     chunk_name, 
-		     pg_indexes_size(('_timescaledb_internal.'||chunk_name)::regclass) chunk_index_size, 
-		     pg_total_relation_size(('_timescaledb_internal.'||chunk_name)::regclass) chunk_total_size 
-		   from timescaledb_information.chunks 
+		   select distinct ON (hypertable_name)
+		     hypertable_name,
+		     chunk_name,
+		     pg_indexes_size(('_timescaledb_internal.'||chunk_name)::regclass) chunk_index_size,
+		     pg_total_relation_size(('_timescaledb_internal.'||chunk_name)::regclass) chunk_total_size
+		   from timescaledb_information.chunks
 		   ORDER BY hypertable_name, range_end desc
 		) as info`).
 		Scan(&t.index, &t.total)
@@ -374,14 +376,45 @@ func runInserterCopy(config config, pool *pgxpool.Pool, metric int) {
 			//	seriesIdSamples[i], seriesIdSamples[j] = seriesIdSamples[j], seriesIdSamples[i]
 			//})
 
-			_, err := pool.CopyFrom(
-				context.Background(),
-				pgx.Identifier{fmt.Sprintf("metric_%d", metric)},
-				[]string{"time", "value", "series_id"},
-				pgx.CopyFromRows(data),
-			)
-			if err != nil {
-				panic(err)
+			table := fmt.Sprintf("metric_%d", metric)
+			ctx := context.Background()
+			columns := []string{"time", "value", "series_id"}
+
+			if false /*with onconflict*/ {
+				tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+				if err != nil {
+					panic(err)
+				}
+				defer func() {
+					if err != nil && tx != nil {
+						if err := tx.Rollback(ctx); err != nil {
+							panic(err)
+						}
+					}
+				}()
+
+				if _, err = tx.Exec(ctx, fmt.Sprintf("CREATE TEMPORARY TABLE temp ON COMMIT DROP AS TABLE %s WITH NO DATA", table)); err != nil {
+					panic(err)
+				}
+
+				if _, err = tx.CopyFrom(ctx, pgx.Identifier{"temp"}, columns, pgx.CopyFromRows(data)); err != nil {
+					panic(err)
+				}
+
+				if _, err = tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s(%[2]s) SELECT %[2]s FROM temp ON CONFLICT DO NOTHING", table, strings.Join(columns, ","))); err != nil {
+					panic(err)
+				}
+				tx.Commit(ctx)
+			} else {
+				_, err := pool.CopyFrom(
+					context.Background(),
+					pgx.Identifier{table},
+					columns,
+					pgx.CopyFromRows(data),
+				)
+				if err != nil {
+					panic(err)
+				}
 			}
 			config.ewma.Incr(int64(len(data)))
 		}
