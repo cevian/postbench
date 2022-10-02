@@ -34,7 +34,7 @@ func main() {
 
 	fs := flag.NewFlagSet("postbench", flag.ExitOnError)
 	fs.IntVar(&config.metrics, "metrics", 10, "Number of metrics")
-	fs.IntVar(&config.metrics, "metricConcurrency", 2, "Number of concurrent metrics")
+	fs.IntVar(&config.metricConcurrency, "metricConcurrency", 2, "Number of concurrent metrics")
 	fs.IntVar(&config.series, "series", 100000, "Number of series")
 	fs.IntVar(&config.batches, "batches", 10000, "Number of items in a batch")
 	fs.DurationVar(&config.reportPeriod, "reporting period", time.Second*10, "report period")
