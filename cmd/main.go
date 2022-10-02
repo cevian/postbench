@@ -20,12 +20,13 @@ import (
 )
 
 type config struct {
-	metrics      int
-	series       int
-	batches      int
-	pgURI        string
-	reportPeriod time.Duration
-	ewma         *ewma.Rate
+	metrics           int
+	metricConcurrency int
+	series            int
+	batches           int
+	pgURI             string
+	reportPeriod      time.Duration
+	ewma              *ewma.Rate
 }
 
 func main() {
@@ -33,6 +34,7 @@ func main() {
 
 	fs := flag.NewFlagSet("postbench", flag.ExitOnError)
 	fs.IntVar(&config.metrics, "metrics", 10, "Number of metrics")
+	fs.IntVar(&config.metrics, "metricConcurrency", 2, "Number of concurrent metrics")
 	fs.IntVar(&config.series, "series", 100000, "Number of series")
 	fs.IntVar(&config.batches, "batches", 10000, "Number of items in a batch")
 	fs.DurationVar(&config.reportPeriod, "reporting period", time.Second*10, "report period")
@@ -111,13 +113,18 @@ func run(config config) {
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id) INCLUDE (time, value)", i, i))
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d USING hash (series_id)", i, i))
 		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
+		ts := time.Now().Add(-time.Hour)
 
-		wg.Add(1)
-		go func() {
-			runInserterCopy(config, pool, metric)
-			//runInserter(config, pool, metric)
-			wg.Done()
-		}()
+		for j := 0; j < config.metricConcurrency; j++ {
+			//set to 0 for conflicts
+			secondsOffset := time.Second * time.Duration(j)
+			wg.Add(1)
+			go func() {
+				runInserterCopy(config, pool, metric, ts.Add(secondsOffset))
+				//runInserter(config, pool, metric)
+				wg.Done()
+			}()
+		}
 	}
 
 	wg.Wait()
@@ -145,6 +152,24 @@ func (t *buffers) scan(pool *pgxpool.Pool) {
 
 func (t *buffers) bytes() int64 {
 	return (t.checkpoint + t.clean + t.backend) * 8192
+}
+
+type txn struct {
+	txnid int64
+	mxid  int64
+}
+
+func (t *txn) setZero(zero *txn) {
+	t.txnid -= zero.txnid
+	t.mxid -= zero.mxid
+}
+
+func (t *txn) scan(pool *pgxpool.Pool) {
+	err := pool.QueryRow(context.Background(), "SELECT age('10'::xid), mxid_age('10'::xid)").
+		Scan(&t.txnid, &t.mxid)
+	if err != nil {
+		panic(err)
+	}
 }
 
 type wal struct {
@@ -201,6 +226,9 @@ func runWatcher(config config, pool *pgxpool.Pool) {
 	zeroWal.scan(pool)
 	lastWal := zeroWal
 
+	zeroTxn := txn{}
+	zeroTxn.scan(pool)
+
 	start := time.Now()
 	lastTime := start
 	lastSamples := int64(0)
@@ -229,16 +257,22 @@ func runWatcher(config config, pool *pgxpool.Pool) {
 		iterWal := currentWal
 		iterWal.setZero(&lastWal)
 
+		currentTxn := txn{}
+		currentTxn.scan(pool)
+		currentTxn.setZero(&zeroTxn)
+
 		currentTime := time.Now()
 		durS := currentTime.Sub(start).Seconds()
 		iterS := currentTime.Sub(lastTime).Seconds()
 		chunkSize := &chunkSize{}
 		chunkSize.scan(pool)
 
-		fmt.Printf("Rate is %.2e, %.2e, %.2e, buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f[%4.0f]/sample %4.0fMB/s, total=%4.0f[%4.0f]MB/s %4.0f[%4.0f]/sample, chunk size(MB): %4.0f %4.0f \n",
+		fmt.Printf("Rate is %.2e, %.2e, %.2e, txn=%4.0f %4.0f buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f[%4.0f]/sample %4.0fMB/s, total=%4.0f[%4.0f]MB/s %4.0f[%4.0f]/sample, chunk size(MB): %4.0f %4.0f \n",
 			rate,
 			avg,
 			float64(samples),
+			float64(currentTxn.txnid)/durS,
+			float64(currentTxn.mxid)/durS,
 			/* checkpoints report all buffers only at end of checkpoint so have to use avgs here*/
 			float64(sumBuffers.checkpoint*8192)/float64(samples),
 			float64(sumBuffers.clean*8192)/float64(samples),
@@ -360,8 +394,7 @@ func runInserter(config config, pool *pgxpool.Pool, metric int) {
 
 }
 
-func runInserterCopy(config config, pool *pgxpool.Pool, metric int) {
-	ts := time.Now().Add(-time.Hour)
+func runInserterCopy(config config, pool *pgxpool.Pool, metric int, ts time.Time) {
 	for {
 		ts = ts.Add(time.Second * 10)
 		seriesID := 1
