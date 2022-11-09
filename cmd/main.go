@@ -20,13 +20,15 @@ import (
 )
 
 type config struct {
-	metrics           int
-	metricConcurrency int
-	series            int
-	batches           int
-	pgURI             string
-	reportPeriod      time.Duration
-	ewma              *ewma.Rate
+	metrics             int
+	metricConcurrency   int
+	series              int
+	seriesZipfParameter float64
+	batches             int
+	pgURI               string
+	reportPeriod        time.Duration
+	scrapeDuration      time.Duration
+	ewma                *ewma.Rate
 }
 
 func main() {
@@ -36,8 +38,10 @@ func main() {
 	fs.IntVar(&config.metrics, "metrics", 10, "Number of metrics")
 	fs.IntVar(&config.metricConcurrency, "metricConcurrency", 2, "Number of concurrent metrics")
 	fs.IntVar(&config.series, "series", 100000, "Number of series")
+	fs.Float64Var(&config.seriesZipfParameter, "series-zipf", 0, "Zipf parameter (e.g. 1.1)")
 	fs.IntVar(&config.batches, "batches", 10000, "Number of items in a batch")
 	fs.DurationVar(&config.reportPeriod, "reporting period", time.Second*10, "report period")
+	fs.DurationVar(&config.scrapeDuration, "scrape-duration", time.Second*0, "scrapeDuration ")
 	fs.StringVar(&config.pgURI, "pg-uri", "postgres://localhost/test", "Postgres URI")
 
 	ff.Parse(fs, os.Args[1:])
@@ -115,12 +119,20 @@ func run(config config) {
 		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
 		ts := time.Now().Add(-time.Hour)
 
+		var seriesNumberGen *rand.Zipf
+		if config.seriesZipfParameter > 0 {
+			seriesNumberGen = rand.NewZipf(rand.New(rand.NewSource(99)), config.seriesZipfParameter, 1, uint64(config.series-1))
+		}
 		for j := 0; j < config.metricConcurrency; j++ {
 			//set to 0 for conflicts
 			secondsOffset := time.Second * time.Duration(j)
 			wg.Add(1)
 			go func() {
-				runInserterCopy(config, pool, metric, ts.Add(secondsOffset))
+				numSeries := config.series
+				if config.seriesZipfParameter > 0 && i > 10 {
+					numSeries = int(seriesNumberGen.Uint64()) + 1
+				}
+				runInserterCopy(config, pool, metric, ts.Add(secondsOffset), numSeries)
 				//runInserter(config, pool, metric)
 				wg.Done()
 			}()
@@ -394,13 +406,21 @@ func runInserter(config config, pool *pgxpool.Pool, metric int) {
 
 }
 
-func runInserterCopy(config config, pool *pgxpool.Pool, metric int, ts time.Time) {
+func runInserterCopy(config config, pool *pgxpool.Pool, metric int, ts time.Time, numSeries int) {
+	startScrape := time.Time{}
 	for {
+		if !startScrape.IsZero() && config.scrapeDuration > 0 {
+			sinceLastScape := time.Since(startScrape)
+			if sinceLastScape < config.scrapeDuration {
+				time.Sleep(config.scrapeDuration - sinceLastScape)
+			}
+		}
+		startScrape = time.Now()
 		ts = ts.Add(time.Second * 10)
 		seriesID := 1
-		for seriesID < config.series {
+		for seriesID < numSeries {
 			data := make([][]interface{}, 0, config.batches)
-			for item := 0; item < config.batches; item++ {
+			for item := 0; item < config.batches && seriesID < numSeries; item++ {
 				row := []interface{}{ts, rand.Float64(), int64(seriesID)}
 				data = append(data, row)
 				seriesID++
