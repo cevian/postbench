@@ -120,7 +120,7 @@ func run(config config) {
 			EXECUTE $$CREATE TABLE IF NOT EXISTS metric_%[1]d(time timestamptz NOT NULL, value double precision not null, series_id bigint not null) WITH (autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000)$$;
 			EXECUTE $$TRUNCATE metric_%[1]d$$;
 			EXECUTE $$CREATE UNIQUE INDEX IF NOT EXISTS metric_%[1]d_idx ON metric_%[1]d (series_id, time) INCLUDE (value)$$;
-			EXECUTE $$SELECT create_hypertable('metric_%[1]d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);$$;
+			EXECUTE $$SELECT create_hypertable('metric_%[1]d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false, if_not_exists=>true);$$;
 		END$DO$;
 		`, i))
 		//execSql(pool, fmt.Sprintf("CREATE TABLE IF NOT EXISTS metric_%d(time timestamptz NOT NULL, value double precision not null, series_id bigint not null) WITH (autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000)", i))
