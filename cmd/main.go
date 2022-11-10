@@ -110,7 +110,6 @@ func run(config config) {
 
 	metricsSlice := make([][]int, config.copiers)
 	numSeriesSlice := make([][]int, config.copiers)
-	ts := time.Now().Add(-wallTimeOffset)
 
 	var seriesNumberGen *rand.Zipf
 	if config.seriesZipfParameter > 0 {
@@ -166,6 +165,7 @@ func run(config config) {
 		wg.Done()
 	}()
 
+	ts := time.Now().Add(-wallTimeOffset)
 	for i := range metricsSlice {
 		index := i
 		wg.Add(1)
@@ -527,8 +527,8 @@ func runMultiMetricInserterCopy(config config, pool *pgxpool.Pool, metrics []int
 		wallTimeData := ts.Add(wallTimeOffset)
 		wallTimeNow := time.Now()
 
-		if config.scrapeDuration > 0 && wallTimeData.Before(wallTimeNow) {
-			dur := wallTimeNow.Sub(wallTimeData)
+		if config.scrapeDuration > 0 && wallTimeNow.Before(wallTimeData) {
+			dur := wallTimeData.Sub(wallTimeNow)
 			time.Sleep(dur)
 		}
 
