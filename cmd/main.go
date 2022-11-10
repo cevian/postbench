@@ -510,6 +510,10 @@ func runInserterCopy(config config, pool *pgxpool.Pool, metric int, ts time.Time
 
 func runMultiMetricInserterCopy(config config, pool *pgxpool.Pool, metrics []int, ts time.Time, numSeriesSlice []int) {
 	startScrape := time.Time{}
+	maxSeries := make(map[int]int, len(metrics))
+	for metric_index, metric := range metrics {
+		maxSeries[metric] = numSeriesSlice[metric_index]
+	}
 	for {
 		if !startScrape.IsZero() && config.scrapeDuration > 0 {
 			sinceLastScape := time.Since(startScrape)
@@ -519,16 +523,26 @@ func runMultiMetricInserterCopy(config config, pool *pgxpool.Pool, metrics []int
 		}
 		startScrape = time.Now()
 		ts = ts.Add(time.Second * 10)
-		for metric_index, metric := range metrics {
-			numSeries := numSeriesSlice[metric_index]
-			seriesID := 1
-			for seriesID < numSeries {
+		lastSeries := make(map[int]int, len(metrics))
+		for _, metric := range metrics {
+			lastSeries[metric] = 1
+		}
+
+		for len(lastSeries) > 1 {
+			for metric, seriesID := range lastSeries {
+				numSeries := maxSeries[metric]
 				data := make([][]interface{}, 0, config.batches)
 				for item := 0; item < config.batches && seriesID < numSeries; item++ {
 					row := []interface{}{ts, rand.Float64(), int64(seriesID)}
 					data = append(data, row)
 					seriesID++
 				}
+				if seriesID >= numSeries {
+					delete(lastSeries, metric)
+				} else {
+					lastSeries[metric] = seriesID
+				}
+
 				//rand.Shuffle(len(seriesIdSamples), func(i, j int) {
 				//	seriesIdSamples[i], seriesIdSamples[j] = seriesIdSamples[j], seriesIdSamples[i]
 				//})
