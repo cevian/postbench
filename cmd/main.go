@@ -23,6 +23,7 @@ type config struct {
 	metrics             int
 	metricConcurrency   int
 	copiers             int
+	chunkSize           time.Duration
 	series              int
 	seriesZipfParameter float64
 	batches             int
@@ -40,6 +41,7 @@ func main() {
 	fs := flag.NewFlagSet("postbench", flag.ExitOnError)
 	fs.IntVar(&config.metrics, "metrics", 10, "Number of metrics")
 	fs.IntVar(&config.copiers, "copiers", 15, "Number of copiers")
+	fs.DurationVar(&config.chunkSize, "chunk-size", time.Hour, "chunk size")
 	fs.IntVar(&config.metricConcurrency, "metricConcurrency", 2, "Number of concurrent metrics")
 	fs.IntVar(&config.series, "series", 100000, "Number of series")
 	fs.Float64Var(&config.seriesZipfParameter, "series-zipf", 0, "Zipf parameter (e.g. 1.1)")
@@ -123,9 +125,9 @@ func run(config config) {
 			EXECUTE $$CREATE TABLE IF NOT EXISTS metric_%[1]d(time timestamptz NOT NULL, value double precision not null, series_id bigint not null) WITH (autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000)$$;
 			EXECUTE $$TRUNCATE metric_%[1]d$$;
 			EXECUTE $$CREATE UNIQUE INDEX IF NOT EXISTS metric_%[1]d_idx ON metric_%[1]d (series_id, time) INCLUDE (value)$$;
-			EXECUTE $$SELECT create_hypertable('metric_%[1]d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false, if_not_exists=>true);$$;
+			EXECUTE $$SELECT create_hypertable('metric_%[1]d', 'time', chunk_time_interval=> (interval '%[2]d minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false, if_not_exists=>true);$$;
 		END$DO$;
-		`, i))
+		`, i, int(config.chunkSize.Minutes())))
 		//execSql(pool, fmt.Sprintf("CREATE TABLE IF NOT EXISTS metric_%d(time timestamptz NOT NULL, value double precision not null, series_id bigint not null) WITH (autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000)", i))
 		//execSql(pool, fmt.Sprintf("TRUNCATE metric_%d", i))
 		//execSql(pool, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id, time) INCLUDE (value)", i, i))
