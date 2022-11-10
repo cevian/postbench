@@ -165,12 +165,11 @@ func run(config config) {
 		wg.Done()
 	}()
 
-	ts := time.Now().Add(-wallTimeOffset)
 	for i := range metricsSlice {
 		index := i
 		wg.Add(1)
 		go func() {
-			runMultiMetricInserterCopy(config, pool, metricsSlice[index], ts, numSeriesSlice[index])
+			runMultiMetricInserterCopy(config, pool, metricsSlice[index], time.Now().Add(-wallTimeOffset), numSeriesSlice[index])
 			wg.Done()
 		}()
 		time.Sleep(config.scrapeDuration / time.Duration(len(metricsSlice)))
