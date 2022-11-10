@@ -152,9 +152,10 @@ func run(config config) {
 	}
 
 	for i := range metricsSlice {
+		index := i
 		wg.Add(1)
 		go func() {
-			runMultiMetricInserterCopy(config, pool, metricsSlice[i], ts, numSeriesSlice[i])
+			runMultiMetricInserterCopy(config, pool, metricsSlice[index], ts, numSeriesSlice[index])
 			wg.Done()
 		}()
 	}
@@ -243,7 +244,7 @@ func (t *chunkSize) scan(pool *pgxpool.Pool) {
 		) as info`).
 		Scan(&t.index, &t.total)
 	if err != nil {
-		panic(err)
+		//panic(err)
 	}
 }
 
