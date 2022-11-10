@@ -108,6 +108,15 @@ func run(config config) {
 	$$
 	LANGUAGE PLPGSQL`)
 
+	copiers := 5
+	metricsSlice := make([][]int, copiers)
+	numSeriesSlice := make([][]int, copiers)
+	ts := time.Now().Add(-time.Hour)
+
+	var seriesNumberGen *rand.Zipf
+	if config.seriesZipfParameter > 0 {
+		seriesNumberGen = rand.NewZipf(rand.New(rand.NewSource(99)), config.seriesZipfParameter, 1, uint64(config.series-1))
+	}
 	for i := 0; i < config.metrics; i++ {
 		metric := i
 		execSql(pool, fmt.Sprintf("DROP TABLE IF EXISTS metric_%d", i))
@@ -117,13 +126,16 @@ func run(config config) {
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id) INCLUDE (time, value)", i, i))
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d USING hash (series_id)", i, i))
 		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
-		ts := time.Now().Add(-time.Hour)
 
-		var seriesNumberGen *rand.Zipf
-		if config.seriesZipfParameter > 0 {
-			seriesNumberGen = rand.NewZipf(rand.New(rand.NewSource(99)), config.seriesZipfParameter, 1, uint64(config.series-1))
+		index := i % len(metricsSlice)
+		metricsSlice[index] = append(metricsSlice[index], metric)
+		numSeries := config.series
+		if config.seriesZipfParameter > 0 && i > 10 {
+			numSeries = int(seriesNumberGen.Uint64()) + 1
 		}
-		for j := 0; j < config.metricConcurrency; j++ {
+		numSeriesSlice[index] = append(numSeriesSlice[index], numSeries)
+
+		/*for j := 0; j < config.metricConcurrency; j++ {
 			//set to 0 for conflicts
 			secondsOffset := time.Second * time.Duration(j)
 			wg.Add(1)
@@ -136,7 +148,15 @@ func run(config config) {
 				//runInserter(config, pool, metric)
 				wg.Done()
 			}()
-		}
+		}*/
+	}
+
+	for i := range metricsSlice {
+		wg.Add(1)
+		go func() {
+			runMultiMetricInserterCopy(config, pool, metricsSlice[i], ts, numSeriesSlice[i])
+			wg.Done()
+		}()
 	}
 
 	wg.Wait()
@@ -473,4 +493,75 @@ func runInserterCopy(config config, pool *pgxpool.Pool, metric int, ts time.Time
 		}
 	}
 
+}
+
+func runMultiMetricInserterCopy(config config, pool *pgxpool.Pool, metrics []int, ts time.Time, numSeriesSlice []int) {
+	startScrape := time.Time{}
+	for {
+		if !startScrape.IsZero() && config.scrapeDuration > 0 {
+			sinceLastScape := time.Since(startScrape)
+			if sinceLastScape < config.scrapeDuration {
+				time.Sleep(config.scrapeDuration - sinceLastScape)
+			}
+		}
+		startScrape = time.Now()
+		ts = ts.Add(time.Second * 10)
+		for metric_index, metric := range metrics {
+			numSeries := numSeriesSlice[metric_index]
+			seriesID := 1
+			for seriesID < numSeries {
+				data := make([][]interface{}, 0, config.batches)
+				for item := 0; item < config.batches && seriesID < numSeries; item++ {
+					row := []interface{}{ts, rand.Float64(), int64(seriesID)}
+					data = append(data, row)
+					seriesID++
+				}
+				//rand.Shuffle(len(seriesIdSamples), func(i, j int) {
+				//	seriesIdSamples[i], seriesIdSamples[j] = seriesIdSamples[j], seriesIdSamples[i]
+				//})
+
+				table := fmt.Sprintf("metric_%d", metric)
+				ctx := context.Background()
+				columns := []string{"time", "value", "series_id"}
+
+				if false /*with onconflict*/ {
+					tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+					if err != nil {
+						panic(err)
+					}
+					defer func() {
+						if err != nil && tx != nil {
+							if err := tx.Rollback(ctx); err != nil {
+								panic(err)
+							}
+						}
+					}()
+
+					if _, err = tx.Exec(ctx, fmt.Sprintf("CREATE TEMPORARY TABLE temp ON COMMIT DROP AS TABLE %s WITH NO DATA", table)); err != nil {
+						panic(err)
+					}
+
+					if _, err = tx.CopyFrom(ctx, pgx.Identifier{"temp"}, columns, pgx.CopyFromRows(data)); err != nil {
+						panic(err)
+					}
+
+					if _, err = tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s(%[2]s) SELECT %[2]s FROM temp ON CONFLICT DO NOTHING", table, strings.Join(columns, ","))); err != nil {
+						panic(err)
+					}
+					tx.Commit(ctx)
+				} else {
+					_, err := pool.CopyFrom(
+						context.Background(),
+						pgx.Identifier{table},
+						columns,
+						pgx.CopyFromRows(data),
+					)
+					if err != nil {
+						panic(err)
+					}
+				}
+				config.ewma.Incr(int64(len(data)))
+			}
+		}
+	}
 }
