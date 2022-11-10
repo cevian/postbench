@@ -22,6 +22,7 @@ import (
 type config struct {
 	metrics             int
 	metricConcurrency   int
+	copiers             int
 	series              int
 	seriesZipfParameter float64
 	batches             int
@@ -36,6 +37,7 @@ func main() {
 
 	fs := flag.NewFlagSet("postbench", flag.ExitOnError)
 	fs.IntVar(&config.metrics, "metrics", 10, "Number of metrics")
+	fs.IntVar(&config.copiers, "copiers", 15, "Number of copiers")
 	fs.IntVar(&config.metricConcurrency, "metricConcurrency", 2, "Number of concurrent metrics")
 	fs.IntVar(&config.series, "series", 100000, "Number of series")
 	fs.Float64Var(&config.seriesZipfParameter, "series-zipf", 0, "Zipf parameter (e.g. 1.1)")
@@ -102,9 +104,8 @@ func run(config config) {
 	$$
 	LANGUAGE PLPGSQL`)
 
-	copiers := 5
-	metricsSlice := make([][]int, copiers)
-	numSeriesSlice := make([][]int, copiers)
+	metricsSlice := make([][]int, config.copiers)
+	numSeriesSlice := make([][]int, config.copiers)
 	ts := time.Now().Add(-time.Hour)
 
 	var seriesNumberGen *rand.Zipf
@@ -168,6 +169,7 @@ func run(config config) {
 			runMultiMetricInserterCopy(config, pool, metricsSlice[index], ts, numSeriesSlice[index])
 			wg.Done()
 		}()
+		time.Sleep(config.scrapeDuration / time.Duration(len(metricsSlice)))
 	}
 
 	wg.Wait()
