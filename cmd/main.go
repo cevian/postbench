@@ -32,6 +32,8 @@ type config struct {
 	ewma                *ewma.Rate
 }
 
+var wallTimeOffset = time.Hour
+
 func main() {
 	var config config
 
@@ -106,7 +108,7 @@ func run(config config) {
 
 	metricsSlice := make([][]int, config.copiers)
 	numSeriesSlice := make([][]int, config.copiers)
-	ts := time.Now().Add(-time.Hour)
+	ts := time.Now().Add(-wallTimeOffset)
 
 	var seriesNumberGen *rand.Zipf
 	if config.seriesZipfParameter > 0 {
@@ -312,7 +314,8 @@ func runWatcher(config config, pool *pgxpool.Pool) {
 		chunkSize := &chunkSize{}
 		chunkSize.scan(pool)
 
-		fmt.Printf("Rate is %.2e, %.2e, %.2e, txn=%4.0f %4.0f buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f[%4.0f]/sample %4.0fMB/s, total=%4.0f[%4.0f]MB/s %4.0f[%4.0f]/sample, chunk size(MB): %4.0f %4.0f \n",
+		fmt.Printf("%v Rate %.2e, %.2e, %.2e, txn=%4.0f %4.0f buffers=%4.0f %4.0f %4.0f %4.0f/sample, wal=%4.0f[%4.0f]/sample %4.0fMB/s, total=%4.0f[%4.0f]MB/s %4.0f[%4.0f]/sample, chunk size(MB): %4.0f %4.0f \n",
+			currentTime.Sub(start),
 			rate,
 			avg,
 			float64(samples),
@@ -509,25 +512,28 @@ func runInserterCopy(config config, pool *pgxpool.Pool, metric int, ts time.Time
 }
 
 func runMultiMetricInserterCopy(config config, pool *pgxpool.Pool, metrics []int, ts time.Time, numSeriesSlice []int) {
-	startScrape := time.Time{}
 	maxSeries := make(map[int]int, len(metrics))
 	for metric_index, metric := range metrics {
 		maxSeries[metric] = numSeriesSlice[metric_index]
 	}
 	for {
-		if !startScrape.IsZero() && config.scrapeDuration > 0 {
-			sinceLastScape := time.Since(startScrape)
-			if sinceLastScape < config.scrapeDuration {
-				time.Sleep(config.scrapeDuration - sinceLastScape)
-			}
+		dataDuration := config.scrapeDuration
+		if config.scrapeDuration <= 0 {
+			dataDuration = 10 * time.Second
 		}
-		startScrape = time.Now()
-		ts = ts.Add(time.Second * 10)
+		ts = ts.Add(dataDuration)
+		wallTimeData := ts.Add(wallTimeOffset)
+		wallTimeNow := time.Now()
+
+		if config.scrapeDuration > 0 && wallTimeData.Before(wallTimeNow) {
+			dur := wallTimeNow.Sub(wallTimeData)
+			time.Sleep(dur)
+		}
+
 		lastSeries := make(map[int]int, len(metrics))
 		for _, metric := range metrics {
 			lastSeries[metric] = 1
 		}
-
 		for len(lastSeries) > 1 {
 			for metric, seriesID := range lastSeries {
 				numSeries := maxSeries[metric]
