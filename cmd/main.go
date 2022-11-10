@@ -45,7 +45,6 @@ func main() {
 	fs.StringVar(&config.pgURI, "pg-uri", "postgres://localhost/test", "Postgres URI")
 
 	ff.Parse(fs, os.Args[1:])
-	config.ewma = ewma.NewEWMARate(1, config.reportPeriod)
 	fmt.Printf("config %#v\n", config)
 	run(config)
 }
@@ -71,11 +70,6 @@ func run(config config) {
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		runWatcher(config, pool)
-		wg.Done()
-	}()
 
 	execSql(pool, "CREATE EXTENSION IF NOT EXISTS timescaledb")
 	execSql(pool, `
@@ -117,15 +111,24 @@ func run(config config) {
 	if config.seriesZipfParameter > 0 {
 		seriesNumberGen = rand.NewZipf(rand.New(rand.NewSource(99)), config.seriesZipfParameter, 1, uint64(config.series-1))
 	}
+	fmt.Println("Creating metrics")
 	for i := 0; i < config.metrics; i++ {
 		metric := i
-		execSql(pool, fmt.Sprintf("DROP TABLE IF EXISTS metric_%d", i))
-		execSql(pool, fmt.Sprintf("CREATE TABLE IF NOT EXISTS metric_%d(time timestamptz NOT NULL, value double precision not null, series_id bigint not null) WITH (autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000)", i))
-		execSql(pool, fmt.Sprintf("TRUNCATE metric_%d", i))
-		execSql(pool, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id, time) INCLUDE (value)", i, i))
+		execSql(pool, fmt.Sprintf(`
+		DO $$
+		BEGIN
+			EXECUTE 'DROP TABLE IF EXISTS metric_%[1]d';
+			EXECUTE 'TRUNCATE metric_%[1]d';
+			EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS metric_%[1]d_idx ON metric_%[1]d (series_id, time) INCLUDE (value)';
+			EXECUTE 'SELECT create_hypertable('metric_%[1]d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);';
+		END$$;
+		`, i))
+		//execSql(pool, fmt.Sprintf("CREATE TABLE IF NOT EXISTS metric_%d(time timestamptz NOT NULL, value double precision not null, series_id bigint not null) WITH (autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000)", i))
+		//execSql(pool, fmt.Sprintf("TRUNCATE metric_%d", i))
+		//execSql(pool, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id, time) INCLUDE (value)", i, i))
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d (series_id) INCLUDE (time, value)", i, i))
 		//execSql(pool, fmt.Sprintf("CREATE INDEX IF NOT EXISTS metric_%d_idx ON metric_%d USING hash (series_id)", i, i))
-		execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
+		//execSql(pool, fmt.Sprintf("SELECT create_hypertable('metric_%d', 'time', chunk_time_interval=> (interval '1 minute' * (1.0+((random()*0.01)-0.005))), create_default_indexes=>false);", i))
 
 		index := i % len(metricsSlice)
 		metricsSlice[index] = append(metricsSlice[index], metric)
@@ -150,6 +153,13 @@ func run(config config) {
 			}()
 		}*/
 	}
+
+	wg.Add(1)
+	config.ewma = ewma.NewEWMARate(1, config.reportPeriod)
+	go func() {
+		runWatcher(config, pool)
+		wg.Done()
+	}()
 
 	for i := range metricsSlice {
 		index := i
